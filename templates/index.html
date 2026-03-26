@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>✨ NVIDIA DGX Spark Magic Factory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Anybody:wght@400;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-brand">
+    <span class="brand-icon">✨</span>
+    <h1>MAGIC FACTORY</h1>
+    <span class="header-tag">NVIDIA DGX Spark · local LLM setup</span>
+  </div>
+  <nav class="header-nav">
+    <button class="nav-btn active" data-view="steps">Steps</button>
+    <button class="nav-btn" data-view="apps">Local Web Apps</button>
+    <button class="nav-btn" data-view="builds">Builds</button>
+    <button class="nav-btn" data-view="logs">Logs</button>
+  </nav>
+  <div class="header-actions">
+    <button id="btn-reset-all" class="hdr-btn reset-all-btn">↺ Reset All</button>
+    <button id="btn-export" class="hdr-btn" disabled>↓ Export Build</button>
+  </div>
+</header>
+
+<main>
+  <!-- ptr h0010002 -->
+  <section id="view-steps" class="view active">
+    <div id="go-bar" class="go-bar">
+      <button id="btn-go" class="go-btn" onclick="startAutorun()">
+        <span class="go-icon">▶</span>
+        <span class="go-label">Go</span>
+      </button>
+      <div id="go-status" class="go-status"></div>
+    </div>
+    <div id="steps-container"></div>
+  </section>
+
+  <section id="view-apps" class="view">
+    <div class="apps-panel">
+      <div class="apps-header">
+        <span class="apps-title">Local Web Apps</span>
+        <span class="apps-subtitle">Services running on this machine</span>
+      </div>
+      <div id="apps-container" class="apps-grid"></div>
+    </div>
+  </section>
+
+  <!-- ptr h0010003 -->
+  <section id="view-builds" class="view">
+    <div id="builds-container"><p class="muted">No builds yet.</p></div>
+  </section>
+
+  <section id="view-logs" class="view">
+    <div id="logs-container" class="log-content"></div>
+  </section>
+</main>
+
+<div id="live-bar" class="live-bar">
+  <div id="live-feed"></div>
+</div>
+
+<script>
+(function(){
+  const $ = s => document.querySelector(s);
+  const stepsEl = $('#steps-container');
+  const buildsEl = $('#builds-container');
+  const logsEl = $('#logs-container');
+  const feedEl = $('#live-feed');
+  const exportBtn = $('#btn-export');
+  const goBtn = $('#btn-go');
+  const goStatus = $('#go-status');
+  const resetAllBtn = $('#btn-reset-all');
+  let steps = [];
+  let autorunActive = false;
+  const _stepProgress = {};
+
+  // ptr h0010004
+  document.querySelectorAll('.nav-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('.nav-btn').forEach(n => n.classList.remove('active'));
+      document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+      b.classList.add('active');
+      document.getElementById('view-' + b.dataset.view).classList.add('active');
+      if (b.dataset.view === 'apps') loadApps();
+      if (b.dataset.view === 'builds') loadBuilds();
+      if (b.dataset.view === 'logs') loadLogs();
+    });
+  });
+
+  // ptr h0010005
+  async function loadSteps() {
+    const r = await fetch('/api/steps');
+    const data = await r.json();
+    steps = data.steps || data;  // handle both shapes
+    autorunActive = !!data.autorun;
+    renderSteps();
+    updateGoButton();
+  }
+
+  function updateGoButton() {
+    if (autorunActive) {
+      goBtn.classList.add('running');
+      goBtn.onclick = stopAutorun;
+      goBtn.innerHTML = '<span class="go-icon">⏹</span><span class="go-label">Stop</span>';
+    } else {
+      goBtn.classList.remove('running');
+      goBtn.onclick = startAutorun;
+      goBtn.innerHTML = '<span class="go-icon">▶</span><span class="go-label">Go</span>';
+    }
+  }
+
+  function renderSteps() {
+    let cat = '', html = '', anyVerified = false;
+    steps.forEach((s, i) => {
+      if (s.category !== cat) {
+        cat = s.category;
+        const label = {preflight:'Preflight',model:'Model',ui:'Chat UI'}[cat]||cat;
+        html += `<div class="cat-label">${label}</div>`;
+      }
+      const r = s.result||{}, v = r.verified===true, f = r.verified===false;
+      const run = s.is_running, att = s.attempts||0, loop = s.loop_info&&s.loop_info.looping;
+      const pend = s.pending_override, hasOv = !!s.override_source;
+      if (v) anyVerified = true;
+      const broken = f||(r.ran_at&&r.status==='error')||loop;
+      const pristine = !r.ran_at && !run && !att;
+      let cls = v?'passed':loop?'looping':f?'failed':run?'running':(r.ran_at&&r.status==='error')?'errored':r.ran_at?'done':'';
+
+      html += `<div class="step ${cls}"><div class="step-left"><div class="step-indicator">${
+        v?'✓':loop?'⟳':f?'✗':run?'◌':(i+1)}</div></div><div class="step-body">
+        <div class="step-top"><div>
+          <div class="step-name">${esc(s.name)}</div>
+          <div class="step-desc">${esc(s.description)}</div>
+          ${att?`<div class="step-attempts">${att} attempt${att>1?'s':''} ${loop?'— LOOP DETECTED':''}</div>`:''}
+          ${hasOv?`<div class="step-override">⚡ Revised by ${esc(s.override_source)}</div>`:''}
+        </div><div class="step-actions">
+          <button class="act-btn run-btn" onclick="runStep('${s.id}')" ${run||autorunActive?'disabled':''}>${run?'⟳…':'▶ Run'}</button>
+          <button class="act-btn verify-btn" onclick="verifyStep('${s.id}')" ${!r.ran_at||run||autorunActive?'disabled':''}>✓ Verify</button>
+          ${!pristine?`<button class="act-btn reset-btn" onclick="resetStep('${s.id}')" title="Reset this step">↺</button>`:''}
+        </div></div>
+        <div class="step-command"><code>${esc(s.command)}</code></div>
+        ${run?`<div class="step-progress" id="progress-${s.id}">
+          <div class="progress-track"><div class="progress-fill" id="fill-${s.id}"></div></div>
+          <div class="progress-meta">
+            <span class="progress-time" id="time-${s.id}"></span>
+            <span class="progress-pct" id="pct-${s.id}"></span>
+          </div>
+          <div class="progress-status" id="status-${s.id}"></div>
+        </div>`:''}
+        ${r.ran_at?renderResult(r):''}
+        ${pend?renderPending(s.id, pend):''}
+        ${broken?`<div class="help-buttons">
+          <button class="claude-btn" onclick="askClaude('${s.id}')">🧠 Ask Claude</button>
+          ${loop||att>=2?`<button class="research-btn" onclick="askClaude('${s.id}')">🔬 Research</button>`:''}
+        </div><div id="claude-${s.id}" class="claude-advice hidden"></div>`:''}
+        ${loop?`<div class="loop-warning">⚠ Loop: ${esc((s.loop_info.reason||'').replace(/_/g,' '))} — try Deep Research or Reset</div>`:''}
+      </div></div>`;
+    });
+    stepsEl.innerHTML = html;
+    exportBtn.disabled = !anyVerified;
+    for (const [sid, data] of Object.entries(_stepProgress)) {
+      if (document.getElementById('fill-' + sid)) {
+        updateProgressBar(sid, data);
+      }
+    }
+  }
+
+  function renderResult(r) {
+    const out = (r.stdout||'').trim(), err = (r.stderr||'').trim();
+    let lbl = r.status||''; if(r.verified===true)lbl='VERIFIED'; if(r.verified===false)lbl='VERIFY FAILED';
+    return `<div class="step-result"><div class="result-meta">
+      <span class="result-status ${r.verified===true?'ok':r.verified===false?'bad':''}">${lbl}</span>
+      ${r.duration?`<span class="result-dur">⏱${r.duration}s</span>`:''}
+      <span class="result-exit">exit ${r.exit_code}</span></div>
+      ${out?`<pre class="result-output">${esc(out.slice(-3000))}</pre>`:''}
+      ${err?`<pre class="result-error">${esc(err.slice(-2000))}</pre>`:''}
+    </div>`;
+  }
+
+  function renderPending(stepId, p) {
+    const w = (p.security_warnings||[]);
+    const isBlocked = w.some(x => x.startsWith('BLOCKED'));
+    if (!isBlocked) return '';
+    return `<div class="pending-override">
+      <div class="pending-header">🛑 Claude suggested a command but it was flagged as potentially dangerous:</div>
+      <pre class="pending-cmd">${esc(p.command)}</pre>
+      <div class="pending-warnings">${w.map(x=>'⚠ '+esc(x)).join('<br>')}</div>
+      <div class="pending-actions">
+        <button class="act-btn approve-btn" onclick="approveOverride('${stepId}')">I trust this — Approve</button>
+        <button class="act-btn reject-btn" onclick="rejectOverride('${stepId}')">✗ Reject</button>
+      </div>
+    </div>`;
+  }
+
+  // ptr h0010008
+  window.runStep = async id => { await fetch(`/api/run/${id}`,{method:'POST'}); loadSteps(); };
+  window.verifyStep = async id => { await fetch(`/api/verify/${id}`,{method:'POST'}); loadSteps(); };
+  window.resetStep = async id => { await fetch(`/api/reset/${id}`,{method:'POST'}); loadSteps(); };
+  window.approveOverride = async id => { await fetch(`/api/approve/${id}`,{method:'POST'}); loadSteps(); };
+  window.rejectOverride = async id => { await fetch(`/api/reject/${id}`,{method:'POST'}); loadSteps(); };
+  window.askClaude = async id => {
+    const el = document.getElementById('claude-'+id);
+    if(el){el.classList.remove('hidden');el.textContent='Asking Claude (with full attempt history)…';}
+    const r = await fetch(`/api/ask-claude/${id}`,{method:'POST'});
+    const d = await r.json();
+    if(el)el.textContent = d.advice||'No response';
+    loadSteps();
+  };
+
+  // ptr h0010009
+  window.startAutorun = async () => {
+    const r = await fetch('/api/autorun',{method:'POST'});
+    const d = await r.json();
+    if (d.error) { addFeed('err', d.error); return; }
+    autorunActive = true;
+    updateGoButton();
+    goStatus.textContent = 'Running all steps…';
+    addFeed('system', 'Autorun started');
+  };
+
+  window.stopAutorun = async () => {
+    await fetch('/api/autorun/stop',{method:'POST'});
+    goStatus.textContent = 'Stopping after current step…';
+    addFeed('system', 'Autorun stop requested');
+  };
+
+  // ptr h001000a
+  resetAllBtn.addEventListener('click', async () => {
+    await fetch('/api/reset-all',{method:'POST'});
+    autorunActive = false;
+    goStatus.textContent = '';
+    updateGoButton();
+    loadSteps();
+    addFeed('system', 'All steps reset');
+  });
+
+  // ptr h001000b
+  exportBtn.addEventListener('click', async () => {
+    const r = await fetch('/api/export',{method:'POST'});
+    const d = await r.json();
+    if(d.error){addFeed('err',d.error);return;}
+    addFeed('build', `Build created: ${d.build_id}${d.duplicate_of?' ⚠ DUPLICATE of '+d.duplicate_of:''}`);
+    loadBuilds();
+  });
+
+  // ptr h001000c
+  async function loadBuilds() {
+    const r = await fetch('/api/builds'); const builds = await r.json();
+    if(!builds.length){buildsEl.innerHTML='<p class="muted">No builds yet.</p>';return;}
+    buildsEl.innerHTML = builds.map(b => {
+      const hc = b.health_checks||[];
+      const lastHC = hc.length?hc[hc.length-1]:null;
+      const hcClass = !lastHC?'':lastHC.passed?'health-ok':'health-fail';
+      const dupWarn = b.duplicate_of?`<div class="dup-warning">⚠ Duplicate of ${esc(b.duplicate_of)}</div>`:'';
+      const iso = b.isolation||{};
+      const isActive = b.active===true;
+      return `<div class="build-card ${b.status||''} ${isActive?'active-build':''}">
+        <div class="build-header">
+          <span class="build-id">${esc(b.build_id)}</span>
+          <span class="build-status ${b.status||''}">${isActive?'⚡ ACTIVE':b.status||'new'}</span>
+        </div>
+        <div class="build-meta">${esc(b.approach||'')} · ${esc(b.created_at||'')} · port ${b.port||'?'}</div>
+        ${dupWarn}
+        <div class="build-isolation">
+          <span title="Docker container name">🐳 ${esc(b.container_name||'')}</span>
+          <span title="Port">:${b.port||'?'}</span>
+          <span title="Shared resources">shared: GPU, Ollama, models</span>
+        </div>
+        <div class="build-health ${hcClass}">
+          ${hc.length?`Health: ${hc.filter(h=>h.passed).length}/${hc.length} passed`:'No health checks yet'}
+          ${lastHC?` · Last: ${lastHC.passed?'✓':'✗'} ${new Date(lastHC.ts).toLocaleString()}`:''}
+        </div>
+        <div class="build-hc-history">${hc.slice(-10).map(h =>
+          `<span class="hc-dot ${h.passed?'ok':'fail'}" title="${esc(h.detail||'')} (${h.ts})"></span>`
+        ).join('')}</div>
+        <div class="build-actions">
+          ${isActive
+            ?`<button class="act-btn" onclick="deactivateBuild('${b.build_id}')">⏹ Deactivate</button>`
+            :`<button class="act-btn approve-btn" onclick="activateBuild('${b.build_id}')">⚡ Activate</button>`}
+          <a href="/api/builds/${b.build_id}/install" target="_blank" class="act-btn">install.sh</a>
+          <a href="/api/builds/${b.build_id}/teardown" target="_blank" class="act-btn">teardown.sh</a>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  window.activateBuild = async id => {
+    addFeed('system', `Activating build ${id}...`);
+    const r = await fetch(`/api/builds/${id}/activate`, {method:'POST'});
+    const d = await r.json();
+    if(d.old) addFeed('system', `Deactivated ${d.old}`);
+    addFeed('build', `Build ${id} is now active`);
+    loadBuilds();
+  };
+  window.deactivateBuild = async id => {
+    await fetch(`/api/builds/${id}/deactivate`, {method:'POST'});
+    addFeed('system', `Deactivated ${id}`);
+    loadBuilds();
+  };
+
+  // ptr h001000d
+  async function loadLogs() {
+    const r = await fetch('/api/logs'); const events = await r.json();
+    logsEl.innerHTML = events.map(e => {
+      const t = e.ts?new Date(e.ts).toLocaleTimeString():'';
+      const sess = e.session?e.session.slice(-6):'';
+      const d = JSON.stringify(e.data||{}).slice(0,200);
+      let cls = '';
+      if(e.type.includes('error')||e.type.includes('fail')||e.type.includes('block'))cls='err';
+      if(e.type.includes('verified')&&e.data?.passed)cls='ok';
+      if(e.type.includes('degraded'))cls='warn';
+      return `<div class="log-entry"><span class="log-ts">${t}</span><span class="log-sess">${sess}</span><span class="log-type ${cls}">${e.type}</span><span class="log-data">${esc(d)}</span></div>`;
+    }).join('');
+    logsEl.scrollTop = logsEl.scrollHeight;
+  }
+
+  // ptr h001000e
+  function updateProgressBar(stepId, data) {
+    const elapsed = data.elapsed || 0;
+    const est = data.estimate_seconds;
+    const line = data.line || '';
+    const stream = data.stream || '';
+
+    _stepProgress[stepId] = {elapsed, estimate: est, lastLine: line, stream};
+
+    const fillEl = document.getElementById('fill-' + stepId);
+    const timeEl = document.getElementById('time-' + stepId);
+    const pctEl  = document.getElementById('pct-' + stepId);
+    const statusEl = document.getElementById('status-' + stepId);
+    if (!fillEl) return;
+
+    const mins = Math.floor(elapsed / 60);
+    const secs = Math.floor(elapsed % 60);
+    let timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+    if (est && est > 0) {
+      const remSecs = Math.max(0, Math.round(est - elapsed));
+      const remMins = Math.floor(remSecs / 60);
+      const remS = remSecs % 60;
+      const remStr = remMins > 0 ? `~${remMins}m ${remS}s left` : `~${remSecs}s left`;
+      timeStr += ' / ' + remStr;
+    }
+    timeEl.textContent = timeStr;
+
+    if (est && est > 0) {
+      const pct = Math.min(95, Math.round((elapsed / est) * 100));
+      pctEl.textContent = pct + '%';
+      fillEl.style.width = pct + '%';
+      fillEl.classList.remove('indeterminate');
+      fillEl.style.transition = elapsed > est ? 'width 2s linear' : 'width 1s linear';
+    } else {
+      pctEl.textContent = '';
+      fillEl.classList.add('indeterminate');
+    }
+
+    if (line) {
+      statusEl.textContent = line;
+      statusEl.className = 'progress-status' + (stream === 'stderr' ? ' progress-stderr' : '');
+    }
+  }
+
+  // ptr h001000f
+  const _SERVICE_URLS = {
+    start_openwebui: 'http://localhost:7733',
+    start_chat:      'http://localhost:7722',
+  };
+  const _openedServices = new Set();
+
+  function autoOpenService(stepId) {
+    const url = _SERVICE_URLS[stepId];
+    if (!url || _openedServices.has(stepId)) return;
+    _openedServices.add(stepId);
+    window.open(url, '_blank');
+  }
+
+  // ptr h0010010
+  let _sseSource = null;
+  function connectSSE() {
+    if (_sseSource) { try { _sseSource.close(); } catch(e){} }
+    const src = new EventSource('/api/events');
+    _sseSource = src;
+    src.onmessage = e => {
+      try {
+        const ev = JSON.parse(e.data);
+        if(ev.type==='ping')return;
+
+        if(ev.type==='step_output') {
+          updateProgressBar(ev.data.step_id, ev.data);
+          return;
+        }
+        if(ev.type==='step_done' || ev.type==='step_reset') {
+          delete _stepProgress[ev.data?.step_id];
+        }
+
+        addFeed(ev.type, JSON.stringify(ev.data||{}).slice(0,150));
+
+        if(ev.type==='autorun_start') { goStatus.textContent='Running all steps…'; }
+        if(ev.type==='autorun_step') { goStatus.textContent=`Step ${ev.data.index}/${ev.data.total}: ${ev.data.name}`; }
+        if(ev.type==='autorun_complete') { goStatus.textContent='✓ All steps passed!'; autorunActive=false; updateGoButton(); }
+        if(ev.type==='autorun_failed') { goStatus.textContent=`✗ Failed: ${ev.data.name}`; autorunActive=false; updateGoButton(); }
+        if(ev.type==='autorun_stopped') { goStatus.textContent='Stopped.'; autorunActive=false; updateGoButton(); }
+        if(ev.type==='autorun_error') { goStatus.textContent=ev.data.msg||'Error'; }
+        if(ev.type==='autorun_retry') { goStatus.textContent=`Retrying: ${ev.data.step_id}`; }
+        if(ev.type==='all_reset') { goStatus.textContent=''; autorunActive=false; updateGoButton(); }
+
+        if(ev.type==='step_verified' && ev.data?.passed && ev.data?.step_id) {
+          autoOpenService(ev.data.step_id);
+        }
+
+        if(['step_done','step_verified','step_running','override_pending','override_approved',
+            'override_rejected','override_applied','override_blocked','step_reset','loop_detected',
+            'step_blocked','all_reset'].includes(ev.type))
+          loadSteps();
+        if(ev.type.startsWith('build_'))loadBuilds();
+      }catch(e){}
+    };
+    src.onopen = () => loadSteps();
+    src.onerror = () => {
+      try { src.close(); } catch(e){}
+      setTimeout(connectSSE, 3000);
+    };
+  }
+
+  function addFeed(type, msg) {
+    const t = new Date().toLocaleTimeString();
+    let cls = 'sys';
+    if(type.includes('error')||type.includes('fail')||type.includes('block')||type==='err')cls='err';
+    if(type.includes('done')||type.includes('verified')||type.includes('approved')||type.includes('complete'))cls='ok';
+    if(type.includes('warn')||type.includes('loop')||type.includes('degrad')||type.includes('dup'))cls='warn';
+    if(type.includes('build'))cls='build';
+    if(type.includes('autorun'))cls='autorun';
+    const d = document.createElement('div');
+    d.className = 'feed-item';
+    d.innerHTML = `<span class="feed-ts">${t}</span><span class="feed-badge ${cls}">${type.replace(/^step_/,'')}</span><span class="feed-msg">${esc(msg)}</span>`;
+    feedEl.appendChild(d);
+    while(feedEl.children.length>200)feedEl.removeChild(feedEl.firstChild);
+    feedEl.scrollTop = feedEl.scrollHeight;
+  }
+
+  function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
+
+  // Local Web Apps tab
+  const appsEl = $('#apps-container');
+  async function loadApps() {
+    try {
+      const r = await fetch('/api/services');
+      const svcs = await r.json();
+      appsEl.innerHTML = svcs.map(s => {
+        const running = s.running;
+        const pill = running
+          ? '<span class="app-pill app-pill-running">Running</span>'
+          : '<span class="app-pill app-pill-stopped">Stopped</span>';
+        const linkCls = running ? 'app-link' : 'app-link app-link-disabled';
+        const href = running ? `href="${s.url}" target="_blank"` : '';
+        const tabindex = running ? '' : 'tabindex="-1"';
+        const isSelf = s.port === 7711;
+        return `<div class="app-card ${running ? 'app-running' : 'app-stopped'}">
+          <div class="app-card-top">
+            <span class="app-label">${esc(s.label)}</span>
+            ${pill}
+          </div>
+          <div class="app-desc">${esc(s.description)}</div>
+          <a class="${linkCls}" ${href} ${tabindex}>${esc(s.url)}</a>
+        </div>`;
+      }).join('');
+    } catch(e) {}
+  }
+  // poll service status every 8 seconds
+  setInterval(loadApps, 8000);
+
+  // ptr h0010012
+  loadSteps();
+  loadApps();
+  connectSSE();
+  addFeed('system', 'UI connected');
+
+  // :)
+  console.log('%c✨ NVIDIA DGX Spark Magic Factory', 'font-size:16px;font-weight:bold;color:#44cc77');
+  console.log('%cBuilt by Chris Morley / Lantern Light AI', 'font-size:12px;color:#6688bb');
+  console.log('%chttps://www.lanternlight.ai | chris.morley@lanternlight.ai', 'font-size:11px;color:#888');
+  console.log('%cAvailable for contracts & 100% remote work. Let\'s build something together.', 'font-size:11px;color:#44cc77;font-style:italic');
+})();
+</script>
+<footer style="text-align:center;padding:1.2rem 0 1rem;font-size:0.78rem;color:#555568;font-family:var(--mono,'JetBrains Mono',monospace);border-top:1px solid #1a1a28;margin-top:2rem;">
+  <div>&copy; 2026 Chris Morley · <a href="https://www.lanternlight.ai" target="_blank" style="color:#44cc77;text-decoration:none;">Lantern Light AI</a> · Made with ❤️ with Claude Code, in Massachusetts</div>
+  <div style="margin-top:0.4rem;">
+    <a href="mailto:chris.morley@lanternlight.ai" style="color:#555568;text-decoration:none;">chris.morley@lanternlight.ai</a>
+    <!-- Like what you see? Chris is available for contracts & 100% remote work. Say hello! -->
+  </div>
+</footer>
+</body>
+</html>
