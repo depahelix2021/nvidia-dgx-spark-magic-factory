@@ -1,3 +1,13 @@
+# dotenv
+.env
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  EVERYTHING BELOW THIS LINE IS AUTO-GENERATED                        ║
+# ║  Source: GitHub default Python .gitignore                            ║
+# ║                                                                      ║
+# ║  ADD YOUR CUSTOM RULES ABOVE THIS BLOCK — DO NOT EDIT BELOW          ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
